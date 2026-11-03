@@ -54,7 +54,13 @@ const ReaderRules = {
     return index < 0 ? null : images[index+1] || null;
   },
   blocks(page, cutoff) { return page.blocks.filter(b => b.from <= cutoff); },
-  images(page, cutoff) { return page.images.filter(i => i.from <= cutoff); },
+  images(page, cutoff) {
+    const blocks = [...(page.blocks || []),...(page.recaps || []).flatMap(r => r.blocks)];
+    return page.images.filter(image => {
+      const anchors = blocks.filter(block => (image.after || []).includes(block.anchor));
+      return image.from <= cutoff && ((image.role === 'primary' && !image.spoiler) || !anchors.length || anchors.some(block => block.from <= cutoff));
+    });
+  },
   keyFacts(page, cutoff) { return (page.key_facts || []).filter(b => b.from <= cutoff && (!b.until || cutoff < b.until)); },
   history(data, page, cutoff) {
     const story = this.blocks(page, cutoff).filter(b => b.kind === 'story');
@@ -296,7 +302,9 @@ if (typeof document !== 'undefined') (() => {
     if (page.from > cutoff || image.from > cutoff || !name(page)) return;
     closeImageViewer();
     const trigger = document.activeElement;
-    const caption = el('p',{id:'image-viewer-caption'},t.noncanonical+' · '+name(page)+' · '+chapterLabel(image.evidence_from || image.from));
+    const caption = el('div',{id:'image-viewer-caption'},
+      el('p',{},t.noncanonical+' · '+name(page)+' · '+chapterLabel(image.evidence_from || image.from)),
+      image.caption ? el('p',{},image.caption) : null);
     const dialog = el('dialog',{class:'image-viewer','aria-label':t.illustration,'aria-describedby':'image-viewer-caption'},
       el('button',{type:'button',class:'image-viewer-close',autofocus:true,onclick:closeImageViewer},t.closeImage+' ×'),
       el('img',{src:image.file,alt:`${name(page)} — ${t.illustration.toLowerCase()}`,decoding:'async'}),caption);
@@ -396,7 +404,10 @@ if (typeof document !== 'undefined') (() => {
     const hasBox = page.category === 'characters' || lead || facts.length;
     const top = el('div',{class:'profile-top'+(hasBox?'':' no-image')});
     const intro = el('div',{class:'prose'});
-    intro.append(...prose(mainBlocks.filter(b => b.kind === 'introduction'),true));
+    const introBlocks = mainBlocks.filter(b => b.kind === 'introduction');
+    const introImages = images.filter(i => !usedImages.has(i.file) && imageAnchor(i,introBlocks));
+    introImages.forEach(i => usedImages.add(i.file));
+    intro.append(...placedProse(introBlocks,introImages,page,t.introduction,true));
     const mainGroups = new Map();
     for (const block of mainBlocks.filter(b => b.kind !== 'introduction')) {
       const heading = block.main_section ? block.heading : t[block.kind] || block.heading;
@@ -409,8 +420,10 @@ if (typeof document !== 'undefined') (() => {
       const m = ref.match(/f-(b\d+)-(c\d+)-/i);
       return m ? data.chapters.find(c => c.id === (m[1]+'-'+m[2]).toUpperCase())?.rank || 0 : 0;
     }));
-    for (const image of pastImages) {
-      const matching = [...mainGroups].find(([,group]) => group.some(b => b.kind === 'history') && refRank(group) >= image.from);
+    for (const image of images.filter(i => !usedImages.has(i.file))) {
+      let matching = [...mainGroups].find(([,group]) => imageAnchor(image,group));
+      if (!matching && !pastImages.includes(image)) continue;
+      matching ||= [...mainGroups].find(([,group]) => group.some(b => b.kind === 'history') && refRank(group) >= image.from);
       const heading = matching?.[0] || [...mainGroups.keys()].at(-1) || t.history;
       if (!mainGroups.has(heading)) mainGroups.set(heading,[]);
       if (!mainImages.has(heading)) mainImages.set(heading,[]);
@@ -418,7 +431,7 @@ if (typeof document !== 'undefined') (() => {
     }
     for (const [heading,group] of mainGroups) {
       const section = el('section',{class:'main-biography-section','data-history-book':group.find(b => b.profile_book)?.profile_book || null},
-        el('h2',{},heading),...prose(group),articleFigures(mainImages.get(heading)||[],page,heading));
+        el('h2',{},heading),...placedProse(group,mainImages.get(heading)||[],page,heading));
       intro.append(section);
     }
     top.append(intro);
@@ -444,8 +457,9 @@ if (typeof document !== 'undefined') (() => {
     // Additional images follow their explanation inside its chapter-gated section, never as an unguarded gallery.
     const sectionImages = new Map();
     for (const image of images.filter(i => !usedImages.has(i.file))) {
+      const anchored = [...groups].find(([,bs]) => imageAnchor(image,bs));
       const matching = [...groups].filter(([,bs]) => Math.max(...bs.map(b => b.from)) >= image.from);
-      const heading = matching[0]?.[0] || [...groups.keys()].at(-1) || t.illustration;
+      const heading = anchored?.[0] || matching[0]?.[0] || [...groups.keys()].at(-1) || t.illustration;
       if (!groups.has(heading)) groups.set(heading,[]);
       if (!sectionImages.has(heading)) sectionImages.set(heading,[]);
       sectionImages.get(heading).push(image);
@@ -455,10 +469,37 @@ if (typeof document !== 'undefined') (() => {
       const ranks = [...group.map(b => b.from),...(sectionImages.get(heading)||[]).map(i => i.from)];
       const title = group[0]?.heading || t.illustration;
       const summary = el('h3',{},title,el('small',{},chapterLabel(Math.max(...ranks))));
-      const content = el('div',{class:'prose'},prose(group),articleFigures(sectionImages.get(heading)||[],page,title));
+      const content = el('div',{class:'prose'},placedProse(group,sectionImages.get(heading)||[],page,title));
       app.append(el('section',{class:'story-section'},summary,content));
     }
     app.append(el('p',{class:'later-note'},t.later),el('a',{href:'index.html',class:'back-link'},'← '+t.back));
+  }
+  function imageAnchor(image, blocks) {
+    return blocks.find(block => (image.after || []).includes(block.anchor))?.anchor;
+  }
+  function imageRuns(images, page, label) {
+    const runs = [];
+    for (const image of images) {
+      const previous = runs.at(-1);
+      if (previous && previous[0].placement === image.placement) previous.push(image);
+      else runs.push([image]);
+    }
+    return runs.map(run => articleFigures(run,page,label));
+  }
+  function placedProse(blocks, images, page, label, lead = false) {
+    const result = [], used = new Set();
+    let pending = [];
+    for (const block of blocks) {
+      pending.push(block);
+      const attached = images.filter(image => !used.has(image.file) && imageAnchor(image,[block]));
+      if (!attached.length) continue;
+      result.push(...prose(pending,lead),...imageRuns(attached,page,label));
+      attached.forEach(image => used.add(image.file));
+      pending = [];
+    }
+    // Legacy/curated unmapped placements are reported by the builder for review.
+    result.push(...prose(pending,lead),...imageRuns(images.filter(image => !used.has(image.file)),page,label));
+    return result;
   }
   // Each call represents one consecutive image run at its existing prose position.
   function articleFigures(images, page, label) {
